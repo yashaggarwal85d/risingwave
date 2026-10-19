@@ -111,6 +111,10 @@ pub(crate) struct PinCacheRefillPlanner {
 }
 
 impl PinCacheRefillPlanner {
+    pub(crate) fn planning_version(&self) -> &PinnedVersion {
+        &self.planning_version
+    }
+
     pub(crate) fn new(planning_version: PinnedVersion) -> Self {
         Self {
             pinned_table_ids: HashSet::new(),

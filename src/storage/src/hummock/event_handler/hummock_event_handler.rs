@@ -32,6 +32,7 @@ use risingwave_common::config::Role;
 use risingwave_common::config::streaming::CacheRefillPolicy;
 use risingwave_common::metrics::UintGauge;
 use risingwave_hummock_sdk::compaction_group::hummock_version_ext::SstDeltaInfo;
+use risingwave_hummock_sdk::version::HummockVersionDelta;
 use risingwave_hummock_sdk::{HummockEpoch, SyncResult};
 use risingwave_pb::meta::table_cache_refill_policies::table_cache_refill_policy::PbCacheRefillPolicy;
 use risingwave_pb::meta::{PbServingTableVnodeMappings, PbTableRefillRuntimeConfig};
@@ -60,6 +61,12 @@ use crate::hummock::{HummockResult, MemoryLimiter, ObjectIdManager, SstableStore
 use crate::mem_table::ImmutableMemtable;
 use crate::monitor::HummockStateStoreMetrics;
 use crate::opts::StorageOpts;
+
+struct ResolvedVersionUpdate {
+    new_pinned_version: PinnedVersion,
+    sst_delta_infos: Vec<SstDeltaInfo>,
+    version_deltas: Option<Vec<HummockVersionDelta>>,
+}
 
 #[derive(Clone)]
 pub(crate) struct BufferTracker {
@@ -502,7 +509,13 @@ impl HummockEventHandler {
             spawn_upload_task,
             buffer_tracker,
         );
-        let refiller = CacheRefiller::new(role, refill_config, sstable_store, spawn_refill_task);
+        let refiller = CacheRefiller::new(
+            role,
+            refill_config,
+            sstable_store,
+            spawn_refill_task,
+            recent_versions.latest_version().clone(),
+        );
 
         Self {
             hummock_event_tx,
@@ -719,42 +732,49 @@ impl HummockEventHandler {
             .cloned()
             .unwrap_or_else(|| self.uploader.hummock_version().clone());
 
-        let mut sst_delta_infos = vec![];
-        if let Some(new_pinned_version) = Self::resolve_version_update_info(
-            &pinned_version,
-            version_payload,
-            Some(&mut sst_delta_infos),
-        ) {
-            self.refiller
-                .start_cache_refill(sst_delta_infos, pinned_version, new_pinned_version);
+        if let Some(ResolvedVersionUpdate {
+            new_pinned_version,
+            sst_delta_infos,
+            version_deltas,
+        }) = Self::resolve_version_update_info(&pinned_version, version_payload)
+        {
+            self.refiller.start_cache_refill(
+                sst_delta_infos,
+                pinned_version,
+                new_pinned_version,
+                version_deltas.as_deref(),
+            );
         }
     }
 
     fn resolve_version_update_info(
         pinned_version: &PinnedVersion,
         version_payload: HummockVersionUpdate,
-        mut sst_delta_infos: Option<&mut Vec<SstDeltaInfo>>,
-    ) -> Option<PinnedVersion> {
+    ) -> Option<ResolvedVersionUpdate> {
         match version_payload {
             HummockVersionUpdate::VersionDeltas(version_deltas) => {
                 let mut version_to_apply = (**pinned_version).clone();
-                {
-                    for version_delta in version_deltas {
-                        assert_eq!(version_to_apply.id, version_delta.prev_id);
-                        if let Some(sst_delta_infos) = &mut sst_delta_infos {
-                            sst_delta_infos
-                                .extend(version_to_apply.build_sst_delta_infos(&version_delta));
-                        }
-
-                        version_to_apply.apply_version_delta(&version_delta);
-                    }
+                let mut sst_delta_infos = Vec::new();
+                for version_delta in &version_deltas {
+                    assert_eq!(version_to_apply.id, version_delta.prev_id);
+                    sst_delta_infos.extend(version_to_apply.build_sst_delta_infos(version_delta));
+                    version_to_apply.apply_version_delta(version_delta);
                 }
-
-                pinned_version.new_with_local_version(version_to_apply)
+                pinned_version
+                    .new_with_local_version(version_to_apply)
+                    .map(|new_pinned_version| ResolvedVersionUpdate {
+                        new_pinned_version,
+                        sst_delta_infos,
+                        version_deltas: Some(version_deltas),
+                    })
             }
-            HummockVersionUpdate::PinnedVersion(version) => {
-                pinned_version.new_pin_version(*version)
-            }
+            HummockVersionUpdate::PinnedVersion(version) => pinned_version
+                .new_pin_version(*version)
+                .map(|new_pinned_version| ResolvedVersionUpdate {
+                    new_pinned_version,
+                    sst_delta_infos: Vec::new(),
+                    version_deltas: None,
+                }),
         }
     }
 
@@ -770,7 +790,7 @@ impl HummockEventHandler {
             return;
         };
         if events.len() > 1 {
-            warn!(
+            debug!(
                 count = events.len(),
                 "handle multiple version updates in batch"
             );
@@ -815,6 +835,7 @@ impl HummockEventHandler {
             for CacheRefillerEvent {
                 pinned_version,
                 new_pinned_version,
+                ..
             } in &events
             {
                 assert_eq!(pinned_version.id(), state.id());
@@ -832,6 +853,7 @@ impl HummockEventHandler {
 
         self.uploader
             .update_pinned_version(latest_pinned_version.clone());
+        self.refiller.on_versions_applied(&events);
     }
 }
 
@@ -1120,6 +1142,7 @@ mod tests {
     use std::future::poll_fn;
     use std::sync::Arc;
     use std::task::Poll;
+    use std::time::Duration;
 
     use futures::FutureExt;
     use parking_lot::Mutex;
@@ -1129,9 +1152,16 @@ mod tests {
     use risingwave_common::config::streaming::CacheRefillPolicy;
     use risingwave_common::hash::VirtualNode;
     use risingwave_common::util::epoch::{EpochExt, test_epoch};
+    use risingwave_hummock_sdk::EpochWithGap;
     use risingwave_hummock_sdk::compaction_group::StaticCompactionGroupId;
-    use risingwave_hummock_sdk::version::HummockVersion;
-    use risingwave_pb::hummock::{PbHummockVersion, StateTableInfo};
+    use risingwave_hummock_sdk::key::{FullKey, UserKey};
+    use risingwave_hummock_sdk::version::{
+        GroupDelta, GroupDeltas, HummockVersion, HummockVersionDelta, IntraLevelDelta,
+    };
+    use risingwave_pb::hummock::hummock_version::PbLevels;
+    use risingwave_pb::hummock::{
+        PbHummockVersion, PbOverlappingLevel, StateTableInfo, StateTableInfoDelta,
+    };
     use risingwave_pb::meta::serving_table_vnode_mappings::PbServingTableVnodeMapping;
     use risingwave_pb::meta::table_cache_refill_policies::PbTableCacheRefillPolicy;
     use risingwave_pb::meta::table_cache_refill_policies::table_cache_refill_policy::PbCacheRefillPolicy;
@@ -1151,15 +1181,210 @@ mod tests {
         prepare_uploader_order_test_spawn_task_fn,
     };
     use crate::hummock::event_handler::{
-        HummockEvent, HummockEventHandler, HummockReadVersionRef, LocalInstanceGuard,
+        HummockEvent, HummockEventHandler, HummockReadVersionRef, HummockVersionUpdate,
+        LocalInstanceGuard,
     };
     use crate::hummock::iterator::test_utils::mock_sstable_store;
     use crate::hummock::local_version::pinned_version::PinnedVersion;
     use crate::hummock::local_version::recent_versions::RecentVersions;
-    use crate::hummock::test_utils::default_opts_for_test;
+    use crate::hummock::pin_cache::PinCache;
+    use crate::hummock::pin_cache::test_utils::in_memory_object_store;
+    use crate::hummock::test_utils::{
+        default_builder_opt_for_test, default_opts_for_test, gen_test_sstable_with_table_ids,
+    };
+    use crate::hummock::value::HummockValue;
     use crate::mem_table::ImmutableMemtable;
     use crate::monitor::HummockStateStoreMetrics;
     use crate::store::SealCurrentEpochOptions;
+
+    #[tokio::test]
+    async fn test_pin_version_deltas_apply_batches_before_retiring_objects() {
+        let table = TableId::from(233);
+        let group = 1.into();
+        let store = mock_sstable_store().await;
+        let mut infos = Vec::new();
+        for object in [880, 881] {
+            let (_, info) = gen_test_sstable_with_table_ids(
+                default_builder_opt_for_test(),
+                object,
+                [(
+                    FullKey {
+                        user_key: UserKey::for_test(
+                            table,
+                            crate::hummock::iterator::test_utils::iterator_test_table_key_of(0),
+                        ),
+                        epoch_with_gap: EpochWithGap::new_from_epoch(test_epoch(1)),
+                    },
+                    HummockValue::put(vec![1]),
+                )]
+                .into_iter(),
+                store.clone(),
+                vec![table.as_raw_id()],
+            )
+            .await;
+            infos.push(info);
+        }
+        let cache = PinCache::new(in_memory_object_store(), u64::MAX, 1, [])
+            .await
+            .unwrap();
+        let store = Arc::new(
+            Arc::into_inner(store)
+                .unwrap()
+                .with_pin_cache(cache.clone()),
+        );
+        let initial = PinnedVersion::new(
+            HummockVersion::from_rpc_protobuf(&PbHummockVersion {
+                id: 1.into(),
+                levels: [(
+                    group,
+                    PbLevels {
+                        group_id: group,
+                        l0: Some(PbOverlappingLevel::default()),
+                        ..Default::default()
+                    },
+                )]
+                .into(),
+                state_table_info: [(
+                    table,
+                    StateTableInfo {
+                        compaction_group_id: group,
+                        ..Default::default()
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            }),
+            unbounded_channel().0,
+        );
+        let metrics = Arc::new(HummockStateStoreMetrics::unused());
+        let options = default_opts_for_test();
+        let (spawn_upload_task, _) = prepare_uploader_order_test_spawn_task_fn(false);
+        let foyer_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let worker_gate = foyer_gate.clone();
+        let mut handler = HummockEventHandler::new_inner(
+            Role::Streaming,
+            unbounded_channel().1,
+            store,
+            metrics.clone(),
+            CacheRefillConfig::from_storage_opts(&options),
+            RecentVersions::new(initial, 10, metrics.clone()),
+            BufferTracker::from_storage_opts(&options, &metrics),
+            spawn_upload_task,
+            Arc::new(move |_, _, _, _| {
+                let gate = worker_gate.clone();
+                tokio::spawn(async move {
+                    gate.acquire().await.unwrap().forget();
+                    true
+                })
+            }),
+        );
+        handler
+            .refiller
+            .replace_table_cache_refill_runtime_snapshot(HashMap::new(), [table].into());
+        let (tx, rx) = oneshot::channel();
+        handler.handle_hummock_event(HummockEvent::RegisterReadVersion {
+            table_id: table,
+            new_read_version_sender: tx,
+            is_replicated: false,
+            vnodes: Arc::new(Bitmap::ones(VirtualNode::COUNT_FOR_TEST)),
+        });
+        let (read_version, mut guard) = rx.await.unwrap();
+        let mut inserted = HummockVersionDelta::default();
+        inserted.prev_id = 1.into();
+        inserted.id = 2.into();
+        inserted.state_table_info_delta.insert(
+            table,
+            StateTableInfoDelta {
+                compaction_group_id: group,
+                committed_epoch: test_epoch(1),
+            },
+        );
+        inserted.group_deltas.insert(
+            group,
+            GroupDeltas {
+                group_deltas: vec![GroupDelta::NewL0SubLevel(vec![infos[0].clone()])],
+            },
+        );
+        handler.handle_version_update(HummockVersionUpdate::VersionDeltas(vec![inserted]));
+        // Rewrite the input SST to a fresh physical object, as a nontrivial compaction does.
+        let mut compacted = HummockVersionDelta::default();
+        compacted.prev_id = 2.into();
+        compacted.id = 3.into();
+        compacted.group_deltas.insert(
+            group,
+            GroupDeltas {
+                group_deltas: vec![GroupDelta::IntraLevel(IntraLevelDelta::new(
+                    0,
+                    1,
+                    [infos[0].sst_id].into(),
+                    vec![infos[1].clone()],
+                    0,
+                    0,
+                ))],
+            },
+        );
+        handler.handle_version_update(HummockVersionUpdate::VersionDeltas(vec![compacted]));
+        let mut committed = HummockVersionDelta::default();
+        committed.prev_id = 3.into();
+        committed.id = 4.into();
+        committed.state_table_info_delta.insert(
+            table,
+            StateTableInfoDelta {
+                compaction_group_id: group,
+                committed_epoch: test_epoch(2),
+            },
+        );
+        handler.handle_version_update(HummockVersionUpdate::VersionDeltas(vec![committed]));
+        assert_eq!(handler.version_update_notifier_tx.borrow().id(), 1);
+        assert!(cache.is_registered(infos[0].object_id));
+        assert!(
+            !cache.is_registered(infos[1].object_id),
+            "queued targets are not resident"
+        );
+        foyer_gate.add_permits(1);
+        let events = tokio::time::timeout(Duration::from_secs(1), handler.refiller.next_events())
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.new_pinned_version.id().as_raw_id())
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        handler.apply_version_updates(events);
+        assert_eq!(handler.version_update_notifier_tx.borrow().id(), 2);
+        foyer_gate.add_permits(2);
+        let events = tokio::time::timeout(Duration::from_secs(1), handler.refiller.next_events())
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (
+                    event.pinned_version.id().as_raw_id(),
+                    event.new_pinned_version.id().as_raw_id()
+                ))
+                .collect::<Vec<_>>(),
+            vec![(2, 3), (3, 4)]
+        );
+        assert!(cache.get(infos[1].object_id).is_some());
+        assert!(
+            cache.is_registered(infos[0].object_id),
+            "readiness cannot retire the applied version"
+        );
+        handler.apply_version_updates(events);
+        assert!(!cache.is_registered(infos[0].object_id));
+        assert!(cache.is_registered(infos[1].object_id));
+        assert_eq!(handler.version_update_notifier_tx.borrow().id(), 4);
+        assert_eq!(handler.recent_versions.load().latest_version().id(), 4);
+        assert_eq!(handler.uploader.hummock_version().id(), 4);
+        assert_eq!(read_version.read().committed().id(), 4);
+        guard.event_sender.take();
+        handler.handle_hummock_event(HummockEvent::DestroyReadVersion {
+            instance_id: guard.instance_id,
+        });
+    }
 
     #[tokio::test]
     async fn test_runtime_config_fields_are_independent_full_replacements() {
@@ -1174,6 +1399,7 @@ mod tests {
             CacheRefillConfig::from_storage_opts(&storage_opt),
             mock_sstable_store().await,
             CacheRefiller::default_spawn_refill_task(),
+            PinnedVersion::new(HummockVersion::default(), unbounded_channel().0),
         );
 
         HummockEventHandler::apply_table_refill_runtime_config(
