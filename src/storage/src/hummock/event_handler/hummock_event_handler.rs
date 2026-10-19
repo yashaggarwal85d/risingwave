@@ -381,7 +381,7 @@ impl HummockEventHandler {
                 .chain(policies.internal_table_policies)
                 .filter_map(table_cache_refill_policy_from_protobuf)
                 .collect();
-            refiller.replace_table_cache_refill_policies(policies);
+            refiller.replace_table_cache_refill_runtime_snapshot(policies, HashSet::new());
         }
 
         if let Some(mappings) = config.serving_table_vnode_mappings {
@@ -1152,9 +1152,7 @@ mod tests {
     use risingwave_common::config::streaming::CacheRefillPolicy;
     use risingwave_common::hash::VirtualNode;
     use risingwave_common::util::epoch::{EpochExt, test_epoch};
-    use risingwave_hummock_sdk::EpochWithGap;
     use risingwave_hummock_sdk::compaction_group::StaticCompactionGroupId;
-    use risingwave_hummock_sdk::key::{FullKey, UserKey};
     use risingwave_hummock_sdk::version::{
         GroupDelta, GroupDeltas, HummockVersion, HummockVersionDelta, IntraLevelDelta,
     };
@@ -1189,10 +1187,7 @@ mod tests {
     use crate::hummock::local_version::recent_versions::RecentVersions;
     use crate::hummock::pin_cache::PinCache;
     use crate::hummock::pin_cache::test_utils::in_memory_object_store;
-    use crate::hummock::test_utils::{
-        default_builder_opt_for_test, default_opts_for_test, gen_test_sstable_with_table_ids,
-    };
-    use crate::hummock::value::HummockValue;
+    use crate::hummock::test_utils::{default_opts_for_test, gen_test_sstable_with_table_vnodes};
     use crate::mem_table::ImmutableMemtable;
     use crate::monitor::HummockStateStoreMetrics;
     use crate::store::SealCurrentEpochOptions;
@@ -1204,24 +1199,7 @@ mod tests {
         let store = mock_sstable_store().await;
         let mut infos = Vec::new();
         for object in [880, 881] {
-            let (_, info) = gen_test_sstable_with_table_ids(
-                default_builder_opt_for_test(),
-                object,
-                [(
-                    FullKey {
-                        user_key: UserKey::for_test(
-                            table,
-                            crate::hummock::iterator::test_utils::iterator_test_table_key_of(0),
-                        ),
-                        epoch_with_gap: EpochWithGap::new_from_epoch(test_epoch(1)),
-                    },
-                    HummockValue::put(vec![1]),
-                )]
-                .into_iter(),
-                store.clone(),
-                vec![table.as_raw_id()],
-            )
-            .await;
+            let (_, info) = gen_test_sstable_with_table_vnodes(&store, object, &[(table, 0)]).await;
             infos.push(info);
         }
         let cache = PinCache::new(in_memory_object_store(), u64::MAX, 1, [])
