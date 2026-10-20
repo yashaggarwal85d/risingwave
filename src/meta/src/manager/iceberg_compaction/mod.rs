@@ -16,6 +16,8 @@ mod gc;
 mod manual;
 mod schedule;
 mod stream;
+#[cfg(test)]
+pub(crate) mod test_utils;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -36,7 +38,6 @@ use tonic::Streaming;
 use super::MetaSrvEnv;
 use crate::MetaResult;
 use crate::barrier::BarrierScheduler;
-use crate::controller::streaming_job::AbortCreatingJobResult;
 use crate::hummock::IcebergCompactorManagerRef;
 use crate::manager::MetadataManager;
 use crate::rpc::metrics::MetaMetrics;
@@ -71,6 +72,8 @@ struct IcebergCompactionManagerInner {
     sink_schedules: HashMap<SinkId, CompactionTrack>,
     /// Recovery isolation survives discarding a track. Generations fence async config loads.
     sink_recovery: HashMap<SinkId, SinkRecoveryState>,
+    /// Never reuse a generation, including after DROP removes a sink's recovery entry.
+    next_recovery_generation: u64,
     snapshot_expiration_sink_ids: HashSet<SinkId>,
     manifest_rewrite_sink_ids: HashSet<SinkId>,
     manual_compaction_waiters: HashMap<SinkId, ManualCompactionWaiter>,
@@ -83,6 +86,11 @@ struct SinkRecoveryState {
 }
 
 impl IcebergCompactionManagerInner {
+    fn next_recovery_generation(&mut self) -> u64 {
+        self.next_recovery_generation += 1;
+        self.next_recovery_generation
+    }
+
     fn recovery_generation(&self, sink_id: SinkId) -> u64 {
         self.sink_recovery
             .get(&sink_id)
@@ -120,6 +128,7 @@ impl IcebergCompactionManager {
                 inner: Arc::new(RwLock::new(IcebergCompactionManagerInner {
                     sink_schedules: HashMap::default(),
                     sink_recovery: HashMap::default(),
+                    next_recovery_generation: 0,
                     snapshot_expiration_sink_ids: HashSet::default(),
                     manifest_rewrite_sink_ids: HashSet::default(),
                     manual_compaction_waiters: HashMap::default(),
@@ -147,17 +156,21 @@ impl IcebergCompactionManager {
     }
 
     async fn load_iceberg_config(&self, sink_id: SinkId) -> MetaResult<IcebergConfig> {
+        let registration = self
+            .inner
+            .read()
+            .sink_schedules
+            .get(&sink_id)
+            .and_then(|track| track.pk_index_registration().cloned());
+        if let Some(registration) = registration {
+            if !registration.is_ready() {
+                return Err(anyhow!("iceberg pk-index sink {} is not ready", sink_id).into());
+            }
+            return Ok((*registration.config()).clone());
+        }
         let sink_param = self.get_sink_param(sink_id).await?;
         let iceberg_config = IcebergConfig::from_btreemap(sink_param.properties)?;
         Ok(iceberg_config)
-    }
-
-    /// Clear the iceberg maintenance state of the sink aborted by
-    /// `try_abort_creating_streaming_job`, if any.
-    pub fn clear_maintenance_for_aborted_job(&self, abort_result: &AbortCreatingJobResult) {
-        for &sink_id in &abort_result.aborted_sink_ids {
-            self.clear_iceberg_maintenance_by_sink_id(sink_id);
-        }
     }
 }
 
