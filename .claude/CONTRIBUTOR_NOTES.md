@@ -11,6 +11,20 @@ Distilled from the Developer Guide (https://risingwavelabs.github.io/risingwave/
   `git fetch upstream main && git checkout -b fix/<topic> upstream/main`
 - Upstream PRs are opened from the fork (head `yashaggarwal85d:<branch>`, base `risingwavelabs:main`).
 
+### Clean PR branches (never mess up the fork)
+- One issue = one branch = one PR. Never reuse a branch, never push PR work to `main` or to the notes branch.
+- Never commit `.claude/`, `risedev-components.user.env`, `.risingwave/`, logs or local config into a PR branch.
+- Develop on `fix/<issue>-<topic>` cut from `upstream/main`. If work happened elsewhere, build the PR
+  branch fresh and bring over only the intended commits / files:
+  `git checkout -b pr/<topic> upstream/main && git cherry-pick <sha>...` (or `git checkout <src> -- <paths>`).
+- Before every push, verify the branch contains exactly what we intend:
+  `git log --oneline upstream/main..HEAD` (only our commits, authored by Yash) and
+  `git diff --stat upstream/main...HEAD` (only the files we meant to touch). Stop if anything else shows up.
+- Base moved? `git fetch upstream main` then `git merge upstream/main` on the PR branch (no rebase or
+  force-push once a PR is open and reviewers have looked at it).
+- Push only that branch: `git push -u origin <branch>`. Then open the PR via
+  `https://github.com/risingwavelabs/risingwave/compare/main...yashaggarwal85d:risingwave:<branch>`.
+
 ## Authorship (user's rule)
 - All commits are authored and committed as Yash Aggarwal
   `68061195+yashaggarwal85d@users.noreply.github.com` (set via `git config user.name/user.email`
