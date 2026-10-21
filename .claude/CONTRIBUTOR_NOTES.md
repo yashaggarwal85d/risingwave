@@ -11,6 +11,12 @@ Distilled from the Developer Guide (https://risingwavelabs.github.io/risingwave/
   `git fetch upstream main && git checkout -b fix/<topic> upstream/main`
 - Upstream PRs are opened from the fork (head `yashaggarwal85d:<branch>`, base `risingwavelabs:main`).
 
+## Authorship (user's rule)
+- All commits are authored and committed as Yash Aggarwal
+  `68061195+yashaggarwal85d@users.noreply.github.com` (set via `git config user.name/user.email`
+  in each fresh clone). Nothing under Claude's name: no `Co-Authored-By: Claude`, no
+  `Claude-Session` trailers in commits, and no "Generated with Claude Code" lines in PR bodies.
+
 ## Finding work
 - Start with `good first issue` (https://github.com/risingwavelabs/risingwave/contribute).
 - Discuss design first for anything non-trivial: comment on the issue (or Slack / Discussions)
