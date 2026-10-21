@@ -16,6 +16,8 @@ Distilled from the Developer Guide (https://risingwavelabs.github.io/risingwave/
   `68061195+yashaggarwal85d@users.noreply.github.com` (set via `git config user.name/user.email`
   in each fresh clone). Nothing under Claude's name: no `Co-Authored-By: Claude`, no
   `Claude-Session` trailers in commits, and no "Generated with Claude Code" lines in PR bodies.
+- Every PR description ends the "What's changed and what's your intention?" section with this
+  exact line: `AI-assisted; I reviewed and understand all changes.`
 
 ## Finding work
 - Start with `good first issue` (https://github.com/risingwavelabs/risingwave/contribute).
